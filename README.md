@@ -66,3 +66,7 @@ To collect library-wide data, in the scala3 build: `scala3-compiler-nonbootstrap
 ## LLM disclosure
 
 This repository was written with Claude Code (Anthropic) during an investigation I directed; I reviewed the method and results.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE).

@@ -1,0 +1,118 @@
+diff --git a/compiler/src/dotty/tools/backend/jvm/analysis/ProdConsAnalyzer.scala b/compiler/src/dotty/tools/backend/jvm/analysis/ProdConsAnalyzer.scala
+index e665d19e2f..f17bde75d6 100644
+--- a/compiler/src/dotty/tools/backend/jvm/analysis/ProdConsAnalyzer.scala
++++ b/compiler/src/dotty/tools/backend/jvm/analysis/ProdConsAnalyzer.scala
+@@ -447,6 +447,11 @@ case class UninitializedLocalProducer(local: Int)
+ case class ExceptionProducer[V <: Value](handlerLabel: LabelNode, handlerStackTop: Int) extends InitialProducer
+ 
+ class InitialProducerSourceInterpreter extends SourceInterpreter(org.objectweb.asm.Opcodes.ASM7) {
++  override def merge(d: SourceValue, w: SourceValue): SourceValue = {
++    val laps = dotty.tools.backend.jvm.opt.LocalOptTiming.currentLaps.get()
++    if (laps != null) { laps.merges += 1; laps.mergeWork += d.insns.size + w.insns.size }
++    super.merge(d, w)
++  }
+   override def newParameterValue(isInstanceMethod: Boolean, local: Int, tp: Type): SourceValue = {
+     new SourceValue(tp.getSize, ParameterProducer(local))
+   }
+diff --git a/compiler/src/dotty/tools/backend/jvm/opt/LocalOptimizer.scala b/compiler/src/dotty/tools/backend/jvm/opt/LocalOptimizer.scala
+index 4348c18dc6..f1f7c7a734 100644
+--- a/compiler/src/dotty/tools/backend/jvm/opt/LocalOptimizer.scala
++++ b/compiler/src/dotty/tools/backend/jvm/opt/LocalOptimizer.scala
+@@ -168,7 +168,7 @@ final class LocalOptimizer(callGraph: CallGraph, inliner: Inliner,
+    */
+   def run(clazz: ClassNode): Boolean = {
+     clazz.methods.asScala.foldLeft(false) {
+-      case (changed, method) => methodOptimizations(method, clazz.name) || changed
++      case (changed, method) => LocalOptTiming.timed(method, clazz.name)(methodOptimizations(method, clazz.name)) || changed
+     }
+   }
+ 
+@@ -214,7 +214,12 @@ final class LocalOptimizer(callGraph: CallGraph, inliner: Inliner,
+ 
+       case _ => false
+     }
+-    def traceIfChanged(optName: String): Unit = if (doTrace) {
++    val laps = LocalOptTiming.currentLaps.get()
++    def traceIfChanged(optName: String): Unit = {
++      if (laps != null) laps.lap(optName)
++      traceIfChangedImpl(optName)
++    }
++    def traceIfChangedImpl(optName: String): Unit = if (doTrace) {
+       val after = LogUtils.textify(method)
+       if (currentTrace != after) {
+         println(s"after $optName in ${method.name}")
+@@ -1255,3 +1260,74 @@ object LocalOptImpls {
+     run()
+   }
+ }
++
++/** Ad-hoc instrumentation: when the system property `dotty.opt.timing` names a file, append one CSV
++ *  line per optimized method: owner,name,desc,insnsBefore,insnsAfter,maxLocals,wallNanos,changed,cpuNanos,allocBytes,
++ *  rounds, then cpuNanos per pass and allocBytes per pass in the order of `passes`, then tryCatchBlocks, handlerCover (sum of protected-range lengths), SourceValue merges, merge work (sum of merged set sizes)
++ *  The property is read on each call so it can be toggled in a running sbt server via `eval`.
++ */
++object LocalOptTiming {
++  /** Pass names as passed to `traceIfChanged`; time between checkpoints is attributed to the later one. */
++  val passes = Array("beforeMethodOpt", "nullness", "dce", "boxUnbox", "copyProp", "staleStores", "redundantCasts",
++    "pushPop", "storeLoadPairs", "staleHandlers", "simplifyJumps", "localVariables", "lineNumbers")
++  private val passIndex = passes.zipWithIndex.toMap
++
++  final class Laps {
++    val cpu = new Array[Long](passes.length)
++    val alloc = new Array[Long](passes.length)
++    var rounds = 0
++    var merges = 0L
++    var mergeWork = 0L
++    private var lastCpu = threadMX.getCurrentThreadCpuTime()
++    private var lastAlloc = threadMX.getCurrentThreadAllocatedBytes()
++    def lap(pass: String): Unit = {
++      val c = threadMX.getCurrentThreadCpuTime()
++      val a = threadMX.getCurrentThreadAllocatedBytes()
++      val i = passIndex(pass)
++      cpu(i) += c - lastCpu
++      alloc(i) += a - lastAlloc
++      if (i == 0) rounds += 1
++      lastCpu = c
++      lastAlloc = a
++    }
++    def csv: String = s"$rounds," + cpu.mkString(",") + "," + alloc.mkString(",")
++  }
++  val currentLaps = new ThreadLocal[Laps | Null]
++
++  val threadMX = java.lang.management.ManagementFactory.getThreadMXBean().asInstanceOf[com.sun.management.ThreadMXBean]
++  private var currentPath: String | Null = null
++  private var out: java.io.PrintWriter | Null = null
++
++  private def writer(path: String): java.io.PrintWriter = synchronized {
++    if (path != currentPath) {
++      if (out != null) out.nn.close()
++      out = new java.io.PrintWriter(new java.io.FileWriter(path, true), true)
++      currentPath = path
++    }
++    out.nn
++  }
++
++  inline def timed(method: MethodNode, owner: InternalName)(inline body: Boolean): Boolean = {
++    val path = System.getProperty("dotty.opt.timing")
++    if (path == null) body
++    else {
++      val insnsBefore = method.instructions.size
++      val maxLocals = MethodMax.maxLocals(method)
++      val tcbs = method.tryCatchBlocks.asScala
++      val handlerCover = tcbs.iterator.map(t => method.instructions.indexOf(t.end) - method.instructions.indexOf(t.start)).sum
++      val c0 = threadMX.getCurrentThreadCpuTime()
++      val a0 = threadMX.getCurrentThreadAllocatedBytes()
++      val laps = new Laps
++      currentLaps.set(laps)
++      val t0 = System.nanoTime()
++      val changed = try body finally currentLaps.set(null)
++      val dt = System.nanoTime() - t0
++      val cpu = threadMX.getCurrentThreadCpuTime() - c0
++      val alloc = threadMX.getCurrentThreadAllocatedBytes() - a0
++      record(path.nn, s"$owner,${method.name},${method.desc},$insnsBefore,${method.instructions.size},$maxLocals,$dt,$changed,$cpu,$alloc,${laps.csv},${tcbs.size},$handlerCover,${laps.merges},${laps.mergeWork}")
++      changed
++    }
++  }
++
++  def record(path: String, line: String): Unit = synchronized { writer(path).println(line) }
++}

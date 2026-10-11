@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Build two variants of some Scala library sources with a Scala 3 compiler and A/B benchmark them.
+#
+#   bin/ab --scala3 ~/code/scala/scala3 \
+#          --variant 'opt=-opt -opt-inline:**,!java.**' --variant 'noopt=' \
+#          [--sources 'scala/collection/immutable/Vector.scala scala/util/Using.scala'] \
+#          [--flags '-Yexplicit-nulls -release 17'] [--workloads src/workloads] \
+#          [-- <driver options: --rounds N --ms N --only REGEX>]
+#
+# See README.md.
+set -euo pipefail
+set -f # flags contain globs like **
+
+here="$(cd "$(dirname "$0")/.." && pwd)"
+scala3="" compiler_cp="" lib_cp="" out="$here/out"
+sources="scala/collection/immutable/Vector.scala scala/util/Using.scala scala/util/Sorting.scala"
+flags="-Yexplicit-nulls -release 17"
+workloads="$here/src/workloads"
+variants=()
+skip_build=""
+driver_args=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --scala3) scala3="$2"; shift 2 ;;
+    --compiler-cp) compiler_cp="$2"; shift 2 ;;
+    --lib-cp) lib_cp="$2"; shift 2 ;;
+    --sources) sources="$2"; shift 2 ;;
+    --flags) flags="$2"; shift 2 ;;
+    --variant) variants+=("$2"); shift 2 ;;
+    --workloads) workloads="$2"; shift 2 ;;
+    --out) out="$2"; shift 2 ;;
+    --skip-build) skip_build=1; shift ;;
+    --) shift; driver_args=("$@"); break ;;
+    *) echo "unknown option $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ ${#variants[@]} -eq 2 ]] || { echo "need exactly two --variant label=flags" >&2; exit 2; }
+java="${JAVA_HOME:+$JAVA_HOME/bin/}java"
+mkdir -p "$out"
+
+if [[ -n "$scala3" ]]; then
+  scala3="$(cd "$scala3" && pwd)"
+  if [[ -z "$compiler_cp" ]]; then
+    echo "exporting compiler classpath from $scala3 (sbt)..." >&2
+    compiler_cp="$(cd "$scala3" && sbt --client 'export scala3-compiler-nonbootstrapped/Runtime/fullClasspath' \
+      | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | grep -v '^\[' | tail -1)"
+  fi
+  [[ -n "$lib_cp" ]] || lib_cp="$scala3/library/target/scala3-library-nonbootstrapped/scala-3.10.0/classes:$scala3/library/target/scala-library-nonbootstrapped/classes"
+fi
+[[ -n "$compiler_cp" && -n "$lib_cp" ]] || { echo "need --scala3 or both --compiler-cp and --lib-cp" >&2; exit 2; }
+
+scalac() { "$java" -Xss8m -cp "$compiler_cp" dotty.tools.dotc.Main -classpath "$lib_cp" "$@"; }
+
+labels=()
+if [[ -z "$skip_build" ]]; then
+  src_files=()
+  for s in $sources; do
+    if [[ -f "$s" ]]; then src_files+=("$s"); else src_files+=("$scala3/library/src/$s"); fi
+  done
+  for v in "${variants[@]}"; do
+    label="${v%%=*}"; vflags="${v#*=}"
+    labels+=("$label")
+    rm -rf "$out/$label"; mkdir -p "$out/$label"
+    echo "compiling variant '$label' ($flags $vflags)" >&2
+    # shellcheck disable=SC2086
+    ( time scalac $flags $vflags -d "$out/$label" "${src_files[@]}" ) 2>&1 | grep -E '^real|error' >&2 || true
+    echo "  $(find "$out/$label" -name '*.class' | wc -l | tr -d ' ') classes" >&2
+  done
+  rm -rf "$out/driver" "$out/workloads"; mkdir -p "$out/driver" "$out/workloads"
+  wl_files=(); while IFS= read -r f; do wl_files+=("$f"); done < <(find "$workloads" -name '*.scala')
+  scalac -d "$out/workloads" "${wl_files[@]}"
+  scalac -d "$out/driver" "$here/src/driver/ABBench.scala"
+else
+  for v in "${variants[@]}"; do labels+=("${v%%=*}"); done
+fi
+
+exec "$java" ${AB_JAVA_OPTS:--Xms4g -Xmx4g -XX:+UseParallelGC} -cp "$lib_cp:$out/driver" ABBench \
+  --build "${labels[0]}=$out/${labels[0]}" --build "${labels[1]}=$out/${labels[1]}" \
+  --lib "$lib_cp" --workloads "$out/workloads" "${driver_args[@]}"
